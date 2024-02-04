@@ -172,9 +172,10 @@ class YOLOv3(nn.Module):
         '''
         assert format in ('xywh','xyxy')
 
-        
         ax1,ay1,ax2,ay2 = a
-        bx1,by1,bx2,by2 = b
+        bx1,by1,bx2,by2 = b[:,0], b[:,1], b[:,2], b[:,3]
+
+        device = a.device
 
         if format == 'xywh':
             ax2 = ax1+ax2
@@ -184,11 +185,11 @@ class YOLOv3(nn.Module):
         
         # union
         union_ = (ay2 - ay1)*(ax2 - ax1) + (by2 - by1)*(bx2 - bx1)
-        union_ = max(1e-7, union_)
+        union_ = torch.maximum(torch.tensor(1e-7, device=device), union_)
 
         # intersection
-        intersection_x = torch.clamp(torch.minimum(ax2,bx2) - torch.maximum(ax1, bx1), min = 0, max = union_)
-        intersection_y = torch.clamp(torch.minimum(ay2,by2) - torch.maximum(ay1, by1), min = 0, max = union_)
+        intersection_x = torch.clamp(torch.minimum(ax2,bx2) - torch.maximum(ax1, bx1), min = torch.tensor(0, device=device), max = union_)
+        intersection_y = torch.clamp(torch.minimum(ay2,by2) - torch.maximum(ay1, by1), min = torch.tensor(0, device=device), max = union_)
         intersection_ = intersection_y*intersection_x
 
         union_ = union_ - intersection_
@@ -223,11 +224,11 @@ class YOLOv3(nn.Module):
                 sorted_boxes = confident_detections[curr_class_mask,:5][idx]
                 sorted_boxes[:,:4] = sorted_boxes[:,:4].to(dtype=int)
                 while len(sorted_boxes):
-                    for i , bbox in enumerate(sorted_boxes):
-                        scores = [ (j, YOLOv3.iou(bbox[:4], x[:4], format=bbox_format)) for j,x in enumerate(sorted_boxes[i+1 : ],start=i+1) ]
-                        sorted_boxes = [ sorted_boxes[idx] for idx,iou in scores if iou < NMS_THRESHOLD ] # remove high overlap, preserve others for another location
-                        detections[class_].append(bbox)
-                        break
+                    scores = YOLOv3.iou(sorted_boxes[0,:4], sorted_boxes[1:,:4])
+                    detections[class_].append(sorted_boxes[0])
+                    keep_idx = [ idx for idx,iou in enumerate(scores,start=1) if iou < NMS_THRESHOLD ] # remove high overlap, preserve others for another location
+                    sorted_boxes = sorted_boxes[keep_idx]
+                
         
         batches.append(detections)
         return batches
