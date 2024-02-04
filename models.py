@@ -2,6 +2,7 @@ from torch import nn
 from collections import OrderedDict
 import torch
 import numpy as np
+from torchvision.ops import nms
 # refs
 # https://blog.paperspace.com/how-to-implement-a-yolo-object-detector-in-pytorch/
 # https://pjreddie.com/media/files/papers/YOLOv3.pdf
@@ -169,6 +170,7 @@ class YOLOv3(nn.Module):
     def iou(a, b, format = 'xywh'):
         '''
         return IOU between two boxes, each given as top-left coordinates,  (x1,y1,x2,y2)
+        Deprecated in favor of torchvision inbuilt ops.nms ; No speed gain though :(
         '''
         assert format in ('xywh','xyxy')
 
@@ -220,14 +222,9 @@ class YOLOv3(nn.Module):
                 detections[class_] = []
                 curr_class_mask = torch.where(confident_classes[1] == class_, 1, 0).to(dtype = bool)
                 confident_detections[curr_class_mask,4] = confident_detections[curr_class_mask,5+class_]
-                _, idx = torch.sort(confident_detections[curr_class_mask,4], descending=True)
-                sorted_boxes = confident_detections[curr_class_mask,:5][idx]
-                sorted_boxes[:,:4] = sorted_boxes[:,:4].to(dtype=int)
-                while len(sorted_boxes):
-                    scores = YOLOv3.iou(sorted_boxes[0,:4], sorted_boxes[1:,:4])
-                    detections[class_].append(sorted_boxes[0])
-                    keep_idx = [ idx for idx,iou in enumerate(scores,start=1) if iou < NMS_THRESHOLD ] # remove high overlap, preserve others for another location
-                    sorted_boxes = sorted_boxes[keep_idx]
+                confident_detections[curr_class_mask,2:4] += confident_detections[curr_class_mask,:2]
+                selected_boxes = nms(confident_detections[curr_class_mask,:4], confident_detections[curr_class_mask,4], NMS_THRESHOLD)
+                detections[class_.item()] = confident_detections[curr_class_mask,:5][selected_boxes]
                 
         
         batches.append(detections)
@@ -254,7 +251,7 @@ class YOLOv3(nn.Module):
 
         
         x[:,:,2:4] = torch.exp(x[:,:,2:4])*anchor_dims
-        x[:,:,:2] = (torch.sigmoid(x[:,:,:2]) + cell_grid)*scale_factor - x[:,:,2:4]//2 
+        x[:,:,:2] = (torch.sigmoid(x[:,:,:2]) + cell_grid)*scale_factor - x[:,:,2:4]/2 
         x[:,:,4] = torch.sigmoid(x[:,:,4])
         x[:,:,bbox_attrs:] = torch.sigmoid(x[:,:,bbox_attrs:])
 
