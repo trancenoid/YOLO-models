@@ -166,13 +166,72 @@ class YOLOv3(nn.Module):
 
         return module_list
 
-    def pred_to_detections(preds): #WIP
-        OBJECT_CONFIDENCE = 0.5
-        CLASS_CONFIDENCE = 0.5
+    def iou(a, b, format = 'xywh'):
+        '''
+        return IOU between two boxes, each given as top-left coordinates,  (x1,y1,x2,y2)
+        '''
+        assert format in ('xywh','xyxy')
 
-        anchors = [(116, 90), (156, 198), (373, 326)]
-        # anchors = [(30, 61),  (62, 45),  (59, 119)]
-        # anchors = [(10, 13),  (16, 30),  (33, 23)]
+        
+        ax1,ay1,ax2,ay2 = a
+        bx1,by1,bx2,by2 = b
+
+        if format == 'xywh':
+            ax2 = ax1+ax2
+            ay2 = ay1+ay2
+            bx2 = bx1+bx2
+            by2 = by1+by2
+        
+        # union
+        union_ = (ay2 - ay1)*(ax2 - ax1) + (by2 - by1)*(bx2 - bx1)
+        union_ = max(1e-7, union_)
+
+        # intersection
+        intersection_x = torch.clamp(torch.minimum(ax2,bx2) - torch.maximum(ax1, bx1), min = 0, max = union_)
+        intersection_y = torch.clamp(torch.minimum(ay2,by2) - torch.maximum(ay1, by1), min = 0, max = union_)
+        intersection_ = intersection_y*intersection_x
+
+        union_ = union_ - intersection_
+
+        return intersection_/union_
+
+
+    def predict(self, x, bbox_format = 'xywh', num_classes = 80, OBJECT_CONFIDENCE = 0.7, CLASS_CONFIDENCE = 0.5, NMS_THRESHOLD=0.4):
+        '''
+        x : batch of images (tensors) of shape ( bs, 3, H, W)
+        Perform NMS and return (bs, N, 5) array where N is the no. of bounding boxes selected each having 4
+        coordinates in supplied format and the class confidence score
+        '''
+        with torch.no_grad():
+            x = self(x)
+        preds = torch.cat(tuple(x.values()), dim = 1)
+
+        assert len(preds.shape) == 3 , "preds shape must be (batch_size, num_of_detections, num_classes+5)"
+        batches = []
+        # NMS
+        for i in range(len(preds)):
+            detections = {}
+            confident_detections = torch.nonzero(torch.where(preds[i,:,4] > OBJECT_CONFIDENCE, 1.0, 0.0), as_tuple=True)
+            confident_detections = preds[i, confident_detections[0], :]
+            confident_classes = torch.nonzero(torch.where(confident_detections[:,-(num_classes):] > CLASS_CONFIDENCE, 1.0, 0.0), as_tuple=True)
+            confident_detections = confident_detections[confident_classes[0]]
+            for class_ in torch.unique(confident_classes[1]):
+                detections[class_] = []
+                curr_class_mask = torch.where(confident_classes[1] == class_, 1, 0).to(dtype = bool)
+                confident_detections[curr_class_mask,4] = confident_detections[curr_class_mask,5+class_]
+                _, idx = torch.sort(confident_detections[curr_class_mask,4], descending=True)
+                sorted_boxes = confident_detections[curr_class_mask,:5][idx]
+                sorted_boxes[:,:4] = sorted_boxes[:,:4].to(dtype=int)
+                while len(sorted_boxes):
+                    for i , bbox in enumerate(sorted_boxes):
+                        scores = [ (j, YOLOv3.iou(bbox[:4], x[:4], format=bbox_format)) for j,x in enumerate(sorted_boxes[i+1 : ],start=i+1) ]
+                        sorted_boxes = [ sorted_boxes[idx] for idx,iou in scores if iou < NMS_THRESHOLD ] # remove high overlap, preserve others for another location
+                        detections[class_].append(bbox)
+                        break
+        
+        batches.append(detections)
+        return batches
+
 
     def logits_to_preds(x, num_classes, anchors, img_dim):
         x = x.detach()
@@ -185,15 +244,16 @@ class YOLOv3(nn.Module):
         scale_factor = img_dim/n_cellcols
 
         cell_grid = torch.meshgrid(torch.arange(n_cellcols),torch.arange(n_cellrows), indexing='xy')
-        cell_grid = torch.stack(cell_grid,dim=2).repeat(1,1,3).view(-1,2)
+        cell_grid = torch.stack(cell_grid,dim=2).repeat(1,1,3).view(-1,2).to(device=device)
 
-        anchor_dims = torch.Tensor(anchors, device = device).repeat(n_cellrows*n_cellcols,1)
+        anchor_dims = torch.tensor(anchors, device=device).repeat(n_cellrows*n_cellcols,1)
 
         x = x.permute(0,2,3,1).contiguous()
         x = x.view(batch_size, n_cellcols*n_cellrows*len(anchors), (bbox_attrs + num_classes))
 
-        x[:,:,:2] = (torch.sigmoid(x[:,:,:2]) + cell_grid)*scale_factor
+        
         x[:,:,2:4] = torch.exp(x[:,:,2:4])*anchor_dims
+        x[:,:,:2] = (torch.sigmoid(x[:,:,:2]) + cell_grid)*scale_factor - x[:,:,2:4]//2 
         x[:,:,4] = torch.sigmoid(x[:,:,4])
         x[:,:,bbox_attrs:] = torch.sigmoid(x[:,:,bbox_attrs:])
 
