@@ -3,6 +3,7 @@ from collections import OrderedDict
 import torch
 import numpy as np
 from torchvision.ops import nms
+from functools import lru_cache
 # refs
 # https://blog.paperspace.com/how-to-implement-a-yolo-object-detector-in-pytorch/
 # https://pjreddie.com/media/files/papers/YOLOv3.pdf
@@ -23,7 +24,7 @@ COCO_CLASSES = np.array(['person', 'bicycle', 'car', 'motorbike', 'aeroplane', '
 class YOLOOutput(nn.Module):
     def __init__(self, anchors):
         super(YOLOOutput, self).__init__()
-        self.anchors = anchors
+        self.anchors = nn.Parameter(torch.tensor(anchors), requires_grad=False)
 
 
 class Shortcut(nn.Module):
@@ -198,7 +199,6 @@ class YOLOv3(nn.Module):
 
         return intersection_/union_
 
-
     def predict(self, x, bbox_format = 'xywh', num_classes = 80, OBJECT_CONFIDENCE = 0.7, CLASS_CONFIDENCE = 0.5, NMS_THRESHOLD=0.4):
         '''
         x : batch of images (tensors) of shape ( bs, 3, H, W)
@@ -214,22 +214,30 @@ class YOLOv3(nn.Module):
         # NMS
         for i in range(len(preds)):
             detections = {}
-            confident_detections = torch.nonzero(torch.where(preds[i,:,4] > OBJECT_CONFIDENCE, 1.0, 0.0), as_tuple=True)
+            confident_detections = torch.nonzero(torch.where(preds[i,:,4].gt(OBJECT_CONFIDENCE), 1.0, 0.0), as_tuple=True)
             confident_detections = preds[i, confident_detections[0], :]
-            confident_classes = torch.nonzero(torch.where(confident_detections[:,-(num_classes):] > CLASS_CONFIDENCE, 1.0, 0.0), as_tuple=True)
+            confident_classes = torch.nonzero(torch.where(confident_detections[:,-(num_classes):].gt(CLASS_CONFIDENCE), 1.0, 0.0), as_tuple=True)
             confident_detections = confident_detections[confident_classes[0]]
-            for class_ in torch.unique(confident_classes[1]):
+            for class_ in torch.unique(confident_classes[1], sorted=False):
                 detections[class_] = []
-                curr_class_mask = torch.where(confident_classes[1] == class_, 1, 0).to(dtype = bool)
-                confident_detections[curr_class_mask,4] = confident_detections[curr_class_mask,5+class_]
-                confident_detections[curr_class_mask,2:4] += confident_detections[curr_class_mask,:2]
-                selected_boxes = nms(confident_detections[curr_class_mask,:4], confident_detections[curr_class_mask,4], NMS_THRESHOLD)
-                detections[class_.item()] = confident_detections[curr_class_mask,:5][selected_boxes]
+                curr_class_detections = confident_detections[torch.where(confident_classes[1].eq(class_), True, False)]
+                curr_class_detections[:,4] = curr_class_detections[:,5+class_]
+                curr_class_detections[:,2:4] += curr_class_detections[:,:2]
+                selected_boxes = nms(curr_class_detections[:,:4], curr_class_detections[:,4], NMS_THRESHOLD)
+                detections[class_] = curr_class_detections[:,:5][selected_boxes]
                 
-        
         batches.append(detections)
         return batches
 
+    @lru_cache
+    def create_meshgrid(n_cellcols, n_cellrows, device):
+        x = torch.arange(n_cellcols).view(1, -1)
+        y = torch.arange(n_cellrows).view(-1, 1)
+
+        # Broadcasting to create meshgrid
+        cell_grid = torch.stack([x.repeat(n_cellrows, 1), y.repeat(1, n_cellcols)], dim=2).repeat(1,1,3).view(-1, 2).to(device=device)
+
+        return cell_grid
 
     def logits_to_preds(x, num_classes, anchors, img_dim):
         x = x.detach()
@@ -241,10 +249,9 @@ class YOLOv3(nn.Module):
         n_cellrows = x.shape[3]
         scale_factor = img_dim/n_cellcols
 
-        cell_grid = torch.meshgrid(torch.arange(n_cellcols),torch.arange(n_cellrows), indexing='xy')
-        cell_grid = torch.stack(cell_grid,dim=2).repeat(1,1,3).view(-1,2).to(device=device)
+        cell_grid = YOLOv3.create_meshgrid(n_cellcols, n_cellrows, device)
 
-        anchor_dims = torch.tensor(anchors, device=device).repeat(n_cellrows*n_cellcols,1)
+        anchor_dims = anchors.repeat(n_cellrows*n_cellcols,1)
 
         x = x.permute(0,2,3,1).contiguous()
         x = x.view(batch_size, n_cellcols*n_cellrows*len(anchors), (bbox_attrs + num_classes))
@@ -261,14 +268,15 @@ class YOLOv3(nn.Module):
         cache = {}
         results = {}
         for i, block in enumerate(self.module_list):
-            if isinstance(block[0], (nn.Conv2d, nn.Upsample)):
+            # string comparison is faster than isinstance
+            blocktype = block[0].__class__.__name__
+            if (blocktype in [nn.Conv2d.__name__, nn.Upsample.__name__]):
                 x = block(x)
-            elif isinstance(block[0], Shortcut):
+            elif blocktype == Shortcut.__name__:
                 x = x + cache[block[0].route_from[0]]
-            elif isinstance(block[0], Route):
-                x = torch.cat(tuple(cache[t]
-                              for t in block[0].route_from), dim=1)
-            elif isinstance(block[0], YOLOOutput):
+            elif blocktype == Route.__name__:
+                x = torch.cat(tuple(cache[t] for t in block[0].route_from), dim=1)
+            elif blocktype == YOLOOutput.__name__:
                 results[tuple(block[0].anchors)] = YOLOv3.logits_to_preds(x, num_classes = self.num_classes, 
                                    anchors = block[0].anchors, img_dim = self.img_dim)
 
