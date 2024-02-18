@@ -8,6 +8,9 @@ Some things that has worked so far:
 - Optimizing transpose and reshape operations (in logits_to_preds function) (7 FPS -> 9 FPS)
 - Caching mesh_grid for YOLO layers (9 FPS -> 11 FPS)
 
+Some tools I am using :
+- [Line Profiler](https://pypi.org/project/line-profiler/) : For checking which code piece is taking unreasonable amount of time.
+
 In case you are interested pure forward + prediction FPS is about 18 after all optimizations done above.
 
 Yolov3 official weights : https://pjreddie.com/media/files/yolov3.weights
