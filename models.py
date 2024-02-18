@@ -4,6 +4,7 @@ import torch
 import numpy as np
 from torchvision.ops import nms
 from functools import lru_cache
+from typing import Dict
 # refs
 # https://blog.paperspace.com/how-to-implement-a-yolo-object-detector-in-pytorch/
 # https://pjreddie.com/media/files/papers/YOLOv3.pdf
@@ -20,12 +21,24 @@ COCO_CLASSES = np.array(['person', 'bicycle', 'car', 'motorbike', 'aeroplane', '
                 'oven', 'toaster', 'sink', 'refrigerator', 'book', 'clock', 'vase', 'scissors', 
                 'teddy bear', 'hair drier', 'toothbrush'])
 
+class AnchorSet():
+    def __init__(self, sizes):
+        self.sizes = nn.Parameter(sizes, requires_grad=False)
+    
+    @classmethod
+    def from_string(self, anchor_set_repr):
+        return AnchorSet( torch.tensor( [tuple(int(y.strip()) for y in x[1:-1].split(' ') ) for x in anchor_set_repr.split("_")]) )
 
+    def __repr__(self) -> str:
+        return "_".join([ str(x.cpu().numpy()) for x in self.sizes])
+    
 class YOLOOutput(nn.Module):
     def __init__(self, anchors):
         super(YOLOOutput, self).__init__()
-        self.anchors = nn.Parameter(torch.tensor(anchors), requires_grad=False)
+        self.anchors = anchors
 
+    def forward(self, input):
+        pass
 
 class Shortcut(nn.Module):
     def __init__(self, layer_index, layer_fanout):
@@ -97,7 +110,7 @@ class YOLOv3(nn.Module):
             if isinstance(block[0], (Shortcut, Route)):
                 self.layer_indices_to_store.extend(block[0].route_from)
 
-
+    @torch.jit.ignore
     def make_ConvStack(self, in_channels, out_channels, kernel_size, padding, stride, batchnorm, activation, name_suffix):
         module = nn.Sequential()
         if padding:
@@ -120,6 +133,7 @@ class YOLOv3(nn.Module):
 
         return module
 
+    @torch.jit.ignore
     def make_DarkNetBlock(self, in_channels, filters, sizes, batchnorm, name_suffix, skip_from: int):
         module_list = []
 
@@ -145,6 +159,7 @@ class YOLOv3(nn.Module):
 
         return module_list
 
+    @torch.jit.ignore
     def make_ConvBlock(self, in_channels, filters, sizes, batchnorm, name_suffix):
         module_list = []
 
@@ -168,6 +183,7 @@ class YOLOv3(nn.Module):
 
         return module_list
 
+    @torch.jit.ignore
     def iou(a, b, format = 'xywh'):
         '''
         return IOU between two boxes, each given as top-left coordinates,  (x1,y1,x2,y2)
@@ -199,7 +215,34 @@ class YOLOv3(nn.Module):
 
         return intersection_/union_
 
-    def predict(self, x, bbox_format = 'xywh', num_classes = 80, OBJECT_CONFIDENCE = 0.7, CLASS_CONFIDENCE = 0.5, NMS_THRESHOLD=0.4):
+    def _pred(output_dict : Dict[str, torch.Tensor], bbox_format : str = 'xywh', num_classes  : int= 80, OBJECT_CONFIDENCE : float = 0.7, 
+                CLASS_CONFIDENCE : float = 0.5, NMS_THRESHOLD : float = 0.4):
+        
+        preds = torch.cat([x for x in output_dict.values()], dim = 1)
+        preds = preds[0]
+        assert len(preds.shape) == 2 , "preds shape must be (num_of_detections, num_classes+5)"
+
+        # NMS
+        detections = torch.empty((0,6), device = preds.device)
+        confident_detections = torch.nonzero(torch.where(preds[:,4].gt(OBJECT_CONFIDENCE), 1.0, 0.0)).unbind(-1)
+        confident_detections = preds[confident_detections[0], :]
+        confident_classes = torch.nonzero(torch.where(confident_detections[:,-(num_classes):].gt(CLASS_CONFIDENCE), 1.0, 0.0)).unbind(-1)
+        confident_detections = confident_detections[confident_classes[0]]
+        for class_ in torch.unique(confident_classes[1], sorted=False):
+            mask = confident_classes[1].eq(class_)
+            curr_class_detections = confident_detections[mask,:]
+            curr_class_detections[:,4] = curr_class_detections[:,5+class_]
+            curr_class_detections[:,2:4] += curr_class_detections[:,:2]
+            selected_boxes = nms(curr_class_detections[:,:4], curr_class_detections[:,4], NMS_THRESHOLD)
+            class_rep = class_.repeat(selected_boxes.shape[0]).view(-1,1)
+            _det = torch.cat( (curr_class_detections[selected_boxes,:5], class_rep ), dim=1 ) 
+            detections = torch.cat( ( detections, _det ) )
+
+
+        return detections
+    
+
+    def predict(self, x, **kwargs):
         '''
         x : batch of images (tensors) of shape ( bs, 3, H, W)
         Perform NMS and return (bs, N, 5) array where N is the no. of bounding boxes selected each having 4
@@ -207,27 +250,10 @@ class YOLOv3(nn.Module):
         '''
         with torch.no_grad():
             x = self(x)
-        preds = torch.cat(tuple(x.values()), dim = 1)
 
-        assert len(preds.shape) == 3 , "preds shape must be (batch_size, num_of_detections, num_classes+5)"
-        batches = []
-        # NMS
-        for i in range(len(preds)):
-            detections = {}
-            confident_detections = torch.nonzero(torch.where(preds[i,:,4].gt(OBJECT_CONFIDENCE), 1.0, 0.0), as_tuple=True)
-            confident_detections = preds[i, confident_detections[0], :]
-            confident_classes = torch.nonzero(torch.where(confident_detections[:,-(num_classes):].gt(CLASS_CONFIDENCE), 1.0, 0.0), as_tuple=True)
-            confident_detections = confident_detections[confident_classes[0]]
-            for class_ in torch.unique(confident_classes[1], sorted=False):
-                detections[class_] = []
-                curr_class_detections = confident_detections[torch.where(confident_classes[1].eq(class_), True, False)]
-                curr_class_detections[:,4] = curr_class_detections[:,5+class_]
-                curr_class_detections[:,2:4] += curr_class_detections[:,:2]
-                selected_boxes = nms(curr_class_detections[:,:4], curr_class_detections[:,4], NMS_THRESHOLD)
-                detections[class_] = curr_class_detections[:,:5][selected_boxes]
-                
-        batches.append(detections)
-        return batches
+        return self._pred(x, **kwargs)
+    
+
 
     @lru_cache
     def create_meshgrid(n_cellcols, n_cellrows, device):
@@ -239,7 +265,8 @@ class YOLOv3(nn.Module):
 
         return cell_grid
 
-    def logits_to_preds(x, num_classes, anchors, img_dim):
+
+    def logits_to_preds(x, num_classes, anchors : AnchorSet, img_dim):
         x = x.detach()
         device = x.device
 
@@ -251,10 +278,13 @@ class YOLOv3(nn.Module):
 
         cell_grid = YOLOv3.create_meshgrid(n_cellcols, n_cellrows, device)
 
-        anchor_dims = anchors.repeat(n_cellrows*n_cellcols,1)
+        anchor_dims = anchors.sizes.repeat(n_cellrows*n_cellcols,1)
 
-        x = x.permute(0,2,3,1).contiguous()
-        x = x.view(batch_size, n_cellcols*n_cellrows*len(anchors), (bbox_attrs + num_classes))
+        # x : (Batch, BoxAttr x num_anchors , H , W)
+        # reference : https://github.com/pytorch/vision/blob/main/torchvision/models/detection/ssd.py#L98
+        x = x.view(batch_size, -1, bbox_attrs+num_classes, n_cellcols, n_cellrows)
+        x = x.permute(0,3,4,1,2)
+        x = x.reshape(batch_size, -1, bbox_attrs+num_classes)
 
         
         x[:,:,2:4] = torch.exp(x[:,:,2:4])*anchor_dims
@@ -277,7 +307,7 @@ class YOLOv3(nn.Module):
             elif blocktype == Route.__name__:
                 x = torch.cat(tuple(cache[t] for t in block[0].route_from), dim=1)
             elif blocktype == YOLOOutput.__name__:
-                results[tuple(block[0].anchors)] = YOLOv3.logits_to_preds(x, num_classes = self.num_classes, 
+                results[str(block[0].anchors)] = YOLOv3.logits_to_preds(x, num_classes = self.num_classes, 
                                    anchors = block[0].anchors, img_dim = self.img_dim)
 
             if i in self.layer_indices_to_store:
@@ -285,7 +315,12 @@ class YOLOv3(nn.Module):
 
         return results
 
-    def create_model(self):
+    @torch.jit.ignore
+    def create_model(self, device = 'cuda'):
+        anchorset1 = AnchorSet(torch.tensor([(116, 90),  (156, 198),  (373, 326)], device=device))
+        anchorset2 = AnchorSet(torch.tensor([(30, 61),  (62, 45),  (59, 119)], device=device))
+        anchorset3 = AnchorSet(torch.tensor([(10, 13),  (16, 30),  (33, 23)], device= device))
+
         # DarkNet-53 Body
         self.module_list.append(self.make_ConvStack(in_channels=self.in_channels,
                                                     out_channels=32,
@@ -340,7 +375,7 @@ class YOLOv3(nn.Module):
                                                     name_suffix=len(self.module_list)))
 
         self.module_list.append(nn.Sequential(OrderedDict([(f"yolo_{len(self.module_list)}",
-                                                            YOLOOutput(anchors=[(116, 90),  (156, 198),  (373, 326)]))])))
+                                                            YOLOOutput(anchors=anchorset1))])))
 
         #### HEAD 2 ####
         self.module_list.append(nn.Sequential(OrderedDict(
@@ -378,7 +413,7 @@ class YOLOv3(nn.Module):
                                                     name_suffix=len(self.module_list)))
 
         self.module_list.append(nn.Sequential(OrderedDict([(f"yolo_{len(self.module_list)}",
-                                                            YOLOOutput(anchors=[(30, 61),  (62, 45),  (59, 119)]))])))
+                                                            YOLOOutput(anchors=anchorset2))])))
 
         #### HEAD 3 ####
         self.module_list.append(nn.Sequential(OrderedDict(
@@ -416,13 +451,14 @@ class YOLOv3(nn.Module):
                                                     name_suffix=len(self.module_list)))
 
         self.module_list.append(nn.Sequential(OrderedDict([(f"yolo_{len(self.module_list)}",
-                                                            YOLOOutput(anchors=[(10, 13),  (16, 30),  (33, 23)]))])))
+                                                            YOLOOutput(anchors=anchorset3))])))
 
         assert len(self.module_list) == len(
             self.output_dims), f"At least one layer was not inserted properly, layers : {len(self.module_list)}, outputs dims seen : {len(self.output_dims)} "
 
     # taken from
     # https://blog.paperspace.com/how-to-implement-a-yolo-object-detector-in-pytorch/
+    @torch.jit.ignore
     def load_weights(self, weightfile):
         # Open the weights file
         fp = open(weightfile, "rb")
